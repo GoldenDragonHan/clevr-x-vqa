@@ -1,0 +1,712 @@
+"""
+CLEVR-X Visual Question Answering System
+
+
+Student ID: 2510123
+
+
+Description:
+This script implements a hybrid VQA system combining similarity-based retrieval
+and vision-language model inference for the CLEVR-X challenge.
+
+Key Features:
+- Answer normalization with synonym mapping
+- Two-tier similarity matching (exact + TF-IDF)
+- Qwen3-VL-2B model inference with beam search
+- Multi-strategy output parsing
+- Question-type specific answer validation
+- Robust fallback mechanisms
+
+"""
+
+import os
+import re
+import json
+import random
+from typing import Tuple, List, Dict, Any
+from collections import Counter, defaultdict
+
+import torch
+import pandas as pd
+import numpy as np
+from tqdm import tqdm
+from PIL import Image
+
+from transformers import AutoProcessor, AutoModelForImageTextToText
+from qwen_vl_utils import process_vision_info
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set random seeds for reproducibility
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+class Config:
+    """Configuration parameters for the VQA system."""
+    
+    # Model settings
+    MODEL_PATH = "/kaggle/input/qwen-3-vl/transformers/2b-instruct/1"
+    
+    # Data paths
+    BASE_PATH = "/kaggle/input/vqa-dataset/custom_dataset/custom_dataset"
+    TRAIN_FILE = os.path.join(BASE_PATH, "train_labels.csv")
+    TEST_FILE = os.path.join(BASE_PATH, "test_non_labels.csv")
+    
+    # Generation parameters
+    MAX_NEW_TOKENS = 512
+    NUM_BEAMS = 3
+    
+    # Similarity thresholds
+    EXACT_MATCH_THRESHOLD = 1.0
+    HIGH_SIMILARITY_THRESHOLD = 0.95
+    
+    # TF-IDF parameters
+    TFIDF_NGRAM_RANGE = (1, 3)
+    TFIDF_MAX_FEATURES = 2000
+    
+    # Output
+    OUTPUT_FILE = "submission.csv"
+
+
+# ============================================================================
+# Answer Normalization
+# ============================================================================
+
+class AnswerNormalizer:
+    """
+    Handles answer normalization including synonym mapping and formatting.
+    
+    This ensures consistency between model outputs and ground truth answers.
+    """
+    
+    SYNONYM_MAP = {
+        # Boolean values
+        "true": "yes",
+        "false": "no",
+        "correct": "yes",
+        "incorrect": "no",
+        
+        # Colors
+        "grey": "gray",
+        "silver": "gray",
+        
+        # Materials
+        "metallic": "metal",
+        "shiny": "metal",
+        "matte": "rubber",
+        
+        # Shapes
+        "ball": "sphere",
+        "block": "cube",
+        "box": "cube",
+        
+        # Sizes
+        "big": "large",
+        "tiny": "small",
+        
+        # Numbers
+        "zero": "0", "one": "1", "two": "2", "three": "3",
+        "four": "4", "five": "5", "six": "6", "seven": "7",
+        "eight": "8", "nine": "9", "ten": "10"
+    }
+    
+    @classmethod
+    def normalize(cls, text: str) -> str:
+        """
+        Normalize answer text.
+        
+        Args:
+            text: Raw answer text
+            
+        Returns:
+            Normalized answer string
+        """
+        if text is None:
+            return ""
+        
+        # Convert to lowercase
+        text = text.strip().lower()
+        
+        # Remove trailing punctuation
+        while text and text[-1] in [".", "!", "?", ";", ":"]:
+            text = text[:-1].strip()
+        
+        # Remove brackets like [yes]
+        if text.startswith("[") and text.endswith("]") and " " not in text:
+            text = text[1:-1].strip()
+        
+        # Keep only alphanumeric characters
+        text = "".join(ch for ch in text if ch.isalnum())
+        
+        # Apply synonym mapping
+        if text in cls.SYNONYM_MAP:
+            text = cls.SYNONYM_MAP[text]
+        
+        return text
+    
+    @classmethod
+    def validate(cls, answer: str, question: str) -> str:
+        """
+        Validate answer based on question type.
+        
+        Args:
+            answer: Normalized answer
+            question: Question text
+            
+        Returns:
+            Validated answer (may be corrected)
+        """
+        q_lower = question.lower()
+        
+        # Counting questions
+        if "how many" in q_lower:
+            if answer.isdigit() and 0 <= int(answer) <= 10:
+                return answer
+            # Try to convert word to number
+            for word, num in cls.SYNONYM_MAP.items():
+                if word == answer and num.isdigit():
+                    return num
+        
+        # Yes/No questions
+        if any(q_lower.startswith(p) for p in ["is there", "are there", "is the", "are the", "does"]):
+            if answer in ['yes', 'no']:
+                return answer
+            if answer in ['true', 'correct']:
+                return 'yes'
+            if answer in ['false', 'incorrect']:
+                return 'no'
+        
+        # Color questions
+        if "what color" in q_lower:
+            valid_colors = ['red', 'blue', 'green', 'yellow', 'purple', 'cyan', 'brown', 'gray']
+            if answer in valid_colors:
+                return answer
+        
+        # Shape questions
+        if "what shape" in q_lower:
+            valid_shapes = ['sphere', 'cube', 'cylinder']
+            if answer in valid_shapes:
+                return answer
+        
+        # Material questions
+        if "what material" in q_lower or "made of" in q_lower:
+            if answer in ['metal', 'rubber']:
+                return answer
+        
+        # Size questions
+        if "what size" in q_lower:
+            if answer in ['small', 'large']:
+                return answer
+        
+        return answer
+
+
+# ============================================================================
+# Output Parser
+# ============================================================================
+
+class OutputParser:
+    """
+    Parses model output to extract answer and explanation.
+    
+    Supports multiple output formats with priority-based parsing.
+    """
+    
+    @staticmethod
+    def parse(text: str, fallback_answer: str = "") -> Tuple[str, str]:
+        """
+        Parse model output to extract (explanation, answer).
+        
+        Parsing strategies (in priority order):
+        1. <answer>...</answer> and <think>...</think> tags
+        2. "Final Answer:" pattern
+        3. "Answer:" pattern
+        4. Last line as answer
+        
+        Args:
+            text: Raw model output
+            fallback_answer: Answer to use if parsing fails
+            
+        Returns:
+            Tuple of (explanation, answer)
+        """
+        if not text:
+            return "", fallback_answer
+        
+        raw = text.strip()
+        
+        # Remove "assistant" marker if present
+        lower_raw = raw.lower()
+        marker = "assistant\n"
+        pos = lower_raw.rfind(marker)
+        if pos != -1:
+            answer_block = raw[pos + len(marker):].lstrip()
+        else:
+            answer_block = raw
+        
+        # Strategy 1: Parse <answer> and <think> tags
+        ans_match = re.search(r"<answer>(.*?)</answer>", answer_block, 
+                             re.IGNORECASE | re.DOTALL)
+        think_match = re.search(r"<think>(.*?)</think>", answer_block, 
+                               re.IGNORECASE | re.DOTALL)
+        
+        if ans_match:
+            answer_str = ans_match.group(1).strip()
+            explanation = think_match.group(1).strip() if think_match else ""
+            return explanation, AnswerNormalizer.normalize(answer_str)
+        
+        # Strategy 2: Parse "Final Answer:" pattern
+        final_ans_match = re.search(r"Final Answer:\s*([^\n]+)", answer_block, 
+                                    re.IGNORECASE)
+        if final_ans_match:
+            answer_str = final_ans_match.group(1).strip()
+            explanation = answer_block[:final_ans_match.start()].strip()
+            return explanation, AnswerNormalizer.normalize(answer_str)
+        
+        # Strategy 3: Parse "Answer:" pattern
+        ans_match = re.search(r"Answer:\s*([^\n]+)", answer_block, 
+                             re.IGNORECASE)
+        if ans_match:
+            answer_str = ans_match.group(1).strip()
+            explanation = answer_block[:ans_match.start()].strip()
+            return explanation, AnswerNormalizer.normalize(answer_str)
+        
+        # Strategy 4: Use last line as answer
+        lines = [l.strip() for l in answer_block.split("\n") if l.strip()]
+        if lines:
+            last_line = lines[-1]
+            if len(last_line.split()) <= 3:
+                explanation = "\n".join(lines[:-1])
+                return explanation, AnswerNormalizer.normalize(last_line)
+        
+        # Fallback
+        return answer_block, fallback_answer
+
+
+# ============================================================================
+# Similarity Matcher
+# ============================================================================
+
+class SimilarityMatcher:
+    """
+    Finds similar training questions using exact matching and TF-IDF.
+    
+    Two-tier matching:
+    1. Exact match: O(1) lookup in hash map
+    2. TF-IDF similarity: O(n) cosine similarity computation
+    """
+    
+    def __init__(self, train_data: List[Dict[str, Any]]):
+        """
+        Initialize similarity matcher.
+        
+        Args:
+            train_data: List of training samples with questions and answers
+        """
+        self.train_data = train_data
+        self.question_to_data = defaultdict(list)
+        
+        # Build exact match index
+        for item in train_data:
+            q_normalized = item['question_normalized']
+            self.question_to_data[q_normalized].append(item)
+        
+        # Build TF-IDF index
+        self.questions = [item['question_lower'] for item in train_data]
+        self.vectorizer = TfidfVectorizer(
+            ngram_range=Config.TFIDF_NGRAM_RANGE,
+            max_features=Config.TFIDF_MAX_FEATURES,
+            sublinear_tf=True
+        )
+        self.question_vectors = self.vectorizer.fit_transform(self.questions)
+        
+        print(f"✅ Similarity matcher initialized with {len(train_data)} samples")
+    
+    def find_similar(self, question: str, top_k: int = 10) -> Tuple[List[Dict], float, str]:
+        """
+        Find similar training questions.
+        
+        Args:
+            question: Query question
+            top_k: Number of similar questions to return
+            
+        Returns:
+            Tuple of (similar_items, best_similarity, match_type)
+        """
+        q_normalized = ' '.join(question.lower().split())
+        
+        # Tier 1: Exact match
+        if q_normalized in self.question_to_data:
+            exact_matches = self.question_to_data[q_normalized]
+            
+            # Find most common answer
+            answer_counts = Counter(m['answer'] for m in exact_matches)
+            most_common_answer = answer_counts.most_common(1)[0][0]
+            
+            # Return first match with most common answer
+            result = exact_matches[0].copy()
+            result['answer'] = most_common_answer
+            
+            return [result], 1.0, 'exact'
+        
+        # Tier 2: TF-IDF similarity
+        q_vector = self.vectorizer.transform([question.lower()])
+        similarities = cosine_similarity(q_vector, self.question_vectors)[0]
+        top_indices = np.argsort(similarities)[-top_k:][::-1]
+        
+        matches = [self.train_data[idx] for idx in top_indices]
+        best_similarity = similarities[top_indices[0]]
+        
+        return matches, best_similarity, 'tfidf'
+
+
+# ============================================================================
+# Image Indexer
+# ============================================================================
+
+class ImageIndexer:
+    """
+    Builds an index of all images in the dataset.
+    
+    Supports lookup by filename with or without extension.
+    """
+    
+    @staticmethod
+    def build_index(base_path: str) -> Dict[str, str]:
+        """
+        Build image filename -> full_path mapping.
+        
+        Args:
+            base_path: Root directory to scan
+            
+        Returns:
+            Dictionary mapping filenames to full paths
+        """
+        image_map = {}
+        
+        for root, dirs, files in os.walk(base_path):
+            for f in files:
+                if f.lower().endswith(('.png', '.jpg', '.jpeg')):
+                    full_path = os.path.join(root, f)
+                    
+                    # Store with extension
+                    image_map[f] = full_path
+                    
+                    # Store without extension
+                    name_no_ext = os.path.splitext(f)[0]
+                    if name_no_ext not in image_map:
+                        image_map[name_no_ext] = full_path
+        
+        return image_map
+
+
+# ============================================================================
+# VQA Inference Engine
+# ============================================================================
+
+class VQAEngine:
+    """
+    Main VQA inference engine combining all components.
+    """
+    
+    def __init__(self, model_path: str):
+        """
+        Initialize VQA engine.
+        
+        Args:
+            model_path: Path to Qwen3-VL model
+        """
+        print("🤖 Loading model...")
+        
+        # Load processor
+        self.processor = AutoProcessor.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+            min_pixels=256*28*28,
+            max_pixels=512*28*28
+        )
+        
+        # Load model
+        self.model = AutoModelForImageTextToText.from_pretrained(
+            model_path,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True,
+            ignore_mismatched_sizes=True
+        )
+        
+        self.model.eval()
+        print(f"✅ Model loaded on device: {self.model.device}")
+    
+    def infer(self, image_path: str, question: str) -> Tuple[str, str]:
+        """
+        Run model inference on a single sample.
+        
+        Args:
+            image_path: Path to image file
+            question: Question text
+            
+        Returns:
+            Tuple of (explanation, answer)
+        """
+        # Build prompt
+        prompt = f"Answer the question about this image.\n\nQ: {question}\n"
+        prompt += "Provide a short visual explanation, then answer with a single word.\n"
+        
+        # Build messages
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "image", "image": f"file://{os.path.abspath(image_path)}"},
+                {"type": "text", "text": prompt}
+            ]
+        }]
+        
+        # Apply chat template
+        text = self.processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+        
+        # Process vision inputs
+        image_inputs, video_inputs = process_vision_info(messages)
+        
+        # Prepare inputs
+        inputs = self.processor(
+            text=[text],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt"
+        )
+        
+        # Move to device
+        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+        
+        # Generate
+        with torch.no_grad():
+            generated_ids = self.model.generate(
+                **inputs,
+                max_new_tokens=Config.MAX_NEW_TOKENS,
+                do_sample=False,
+                num_beams=Config.NUM_BEAMS
+            )
+        
+        # Decode
+        generated_ids_trimmed = [
+            out_ids[len(in_ids):]
+            for in_ids, out_ids in zip(inputs['input_ids'], generated_ids)
+        ]
+        
+        output_text = self.processor.batch_decode(
+            generated_ids_trimmed,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False
+        )[0]
+        
+        return output_text
+
+
+# ============================================================================
+# Main Pipeline
+# ============================================================================
+
+def main():
+    """Main execution pipeline."""
+    
+    print("=" * 80)
+    print("🚀 CLEVR-X VQA System")
+    print("=" * 80)
+    
+    # Step 1: Build image index
+    print("\n[1/6] Building image index...")
+    image_map = ImageIndexer.build_index(Config.BASE_PATH)
+    print(f"✅ Indexed {len(image_map)} images")
+    
+    # Step 2: Load training data
+    print("\n[2/6] Loading training data...")
+    train_df = pd.read_csv(Config.TRAIN_FILE)
+    
+    train_data = []
+    for idx, row in tqdm(train_df.iterrows(), total=len(train_df), desc="Parsing"):
+        question = str(row['question']).strip()
+        answer = AnswerNormalizer.normalize(row['answer'])
+        
+        # Parse explanations
+        exp_raw = row.get('explanation', '')
+        try:
+            if isinstance(exp_raw, str) and exp_raw.startswith('['):
+                explanations = eval(exp_raw)
+                if not isinstance(explanations, list):
+                    explanations = [str(exp_raw)]
+            else:
+                explanations = [str(exp_raw)]
+        except:
+            explanations = [str(exp_raw)]
+        
+        train_data.append({
+            'question': question,
+            'question_lower': question.lower(),
+            'question_normalized': ' '.join(question.lower().split()),
+            'answer': answer,
+            'explanations': explanations
+        })
+    
+    print(f"✅ Loaded {len(train_data)} training samples")
+    
+    # Step 3: Initialize similarity matcher
+    print("\n[3/6] Initializing similarity matcher...")
+    matcher = SimilarityMatcher(train_data)
+    
+    # Step 4: Load model
+    print("\n[4/6] Loading VQA model...")
+    engine = VQAEngine(Config.MODEL_PATH)
+    
+    # Step 5: Load test data
+    print("\n[5/6] Loading test data...")
+    test_df = pd.read_csv(Config.TEST_FILE)
+    print(f"✅ Loaded {len(test_df)} test samples")
+    
+    # Detect column names
+    img_col = next((c for c in ['file', 'image', 'filename'] if c in test_df.columns), None)
+    q_col = next((c for c in ['question', 'q', 'text'] if c in test_df.columns), None)
+    
+    # Step 6: Run inference
+    print(f"\n[6/6] Running inference on {len(test_df)} samples...\n")
+    
+    results = []
+    stats = {
+        'total': 0,
+        'exact_match': 0,
+        'high_similarity': 0,
+        'model_success': 0,
+        'fallback': 0,
+        'image_not_found': 0
+    }
+    
+    for idx in tqdm(range(len(test_df)), desc="Inference"):
+        try:
+            row = test_df.iloc[idx]
+            sample_id = row['id']
+            image_name = row[img_col]
+            question = row[q_col]
+            
+            # Get image path
+            img_path = image_map.get(image_name)
+            
+            if not img_path or not os.path.exists(img_path):
+                stats['image_not_found'] += 1
+                results.append({
+                    'id': sample_id,
+                    'answer': 'yes',
+                    'explanation': 'Image not found'
+                })
+                stats['total'] += 1
+                continue
+            
+            # Find similar questions
+            similar_items, similarity, match_type = matcher.find_similar(question, top_k=5)
+            
+            answer = None
+            explanation = None
+            
+            # Strategy 1: Exact match
+            if match_type == 'exact':
+                stats['exact_match'] += 1
+                answer = similar_items[0]['answer']
+                explanation = similar_items[0]['explanations'][0]
+            
+            # Strategy 2: Model inference
+            else:
+                fallback_answer = similar_items[0]['answer'] if similar_items else "yes"
+                fallback_explanation = similar_items[0]['explanations'][0] if similar_items else "The answer is yes."
+                
+                if similarity > Config.HIGH_SIMILARITY_THRESHOLD:
+                    stats['high_similarity'] += 1
+                
+                try:
+                    # Run model
+                    output_text = engine.infer(img_path, question)
+                    
+                    # Parse output
+                    explanation, answer = OutputParser.parse(output_text, fallback_answer)
+                    
+                    # Validate
+                    if answer and explanation and len(explanation) >= 10:
+                        stats['model_success'] += 1
+                    else:
+                        stats['fallback'] += 1
+                        if not answer:
+                            answer = fallback_answer
+                        if not explanation or len(explanation) < 10:
+                            explanation = fallback_explanation
+                
+                except Exception as e:
+                    stats['fallback'] += 1
+                    answer = fallback_answer
+                    explanation = fallback_explanation
+            
+            # Validate answer
+            answer = AnswerNormalizer.validate(answer, question)
+            
+            # Ensure non-empty
+            if not answer:
+                answer = "yes"
+            if not explanation:
+                explanation = f"The answer is {answer}."
+            
+            results.append({
+                'id': sample_id,
+                'answer': str(answer).strip().lower(),
+                'explanation': str(explanation).strip()
+            })
+            
+            stats['total'] += 1
+        
+        except Exception as e:
+            print(f"\n❌ Sample {idx} failed: {e}")
+            results.append({
+                'id': test_df.iloc[idx]['id'],
+                'answer': 'yes',
+                'explanation': 'Processing error'
+            })
+            stats['fallback'] += 1
+            stats['total'] += 1
+    
+    # Save results
+    print("\n💾 Saving results...")
+    submission_df = pd.DataFrame(results)
+    submission_df['answer'] = submission_df['answer'].fillna("yes")
+    submission_df['explanation'] = submission_df['explanation'].fillna("The answer is yes.")
+    submission_df.to_csv(Config.OUTPUT_FILE, index=False)
+    print(f"✅ Saved to {Config.OUTPUT_FILE}")
+    
+    # Print statistics
+    print(f"\n{'='*80}")
+    print("📊 Statistics")
+    print(f"{'='*80}")
+    print(f"\nTotal samples: {stats['total']}")
+    print(f"\nStrategy distribution:")
+    print(f"  Exact match: {stats['exact_match']} ({stats['exact_match']/stats['total']*100:.1f}%)")
+    print(f"  High similarity: {stats['high_similarity']} ({stats['high_similarity']/stats['total']*100:.1f}%)")
+    print(f"  Model success: {stats['model_success']} ({stats['model_success']/stats['total']*100:.1f}%)")
+    print(f"  Fallback used: {stats['fallback']} ({stats['fallback']/stats['total']*100:.1f}%)")
+    print(f"  Image not found: {stats['image_not_found']}")
+    
+    print(f"\n{'='*80}")
+    print("🎉 Complete!")
+    print(f"{'='*80}")
+
+
+if __name__ == "__main__":
+    main()
